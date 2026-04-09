@@ -10,6 +10,7 @@ import (
 
 	sdk "github.com/memohai/twilight-ai/sdk"
 
+	"github.com/memohai/memoh/internal/agent/background"
 	"github.com/memohai/memoh/internal/agent/tools"
 	"github.com/memohai/memoh/internal/models"
 	"github.com/memohai/memoh/internal/workspace/bridge"
@@ -151,6 +152,22 @@ func (a *Agent) runStream(ctx context.Context, cfg RunConfig, ch chan<- StreamEv
 				}
 				break
 			}
+			return p
+		}
+	}
+
+	// Drain background task notifications at step boundaries.
+	// Each notification is injected as a user message so the model
+	// discovers completed background work naturally.
+	if cfg.BackgroundManager != nil {
+		basePrepare := prepareStep
+		prepareStep = func(p *sdk.GenerateParams) *sdk.GenerateParams {
+			if basePrepare != nil {
+				if override := basePrepare(p); override != nil {
+					p = override
+				}
+			}
+			p = drainBackgroundNotifications(p, cfg.BackgroundManager, cfg.Identity.BotID, cfg.Identity.SessionID, a.logger)
 			return p
 		}
 	}
@@ -340,6 +357,21 @@ func (a *Agent) runGenerate(ctx context.Context, cfg RunConfig) (*GenerateResult
 	if readMediaState != nil {
 		prepareStep = readMediaState.prepareStep
 	}
+
+	// Drain background task notifications at step boundaries (non-streaming).
+	if cfg.BackgroundManager != nil {
+		basePrepare := prepareStep
+		prepareStep = func(p *sdk.GenerateParams) *sdk.GenerateParams {
+			if basePrepare != nil {
+				if override := basePrepare(p); override != nil {
+					p = override
+				}
+			}
+			p = drainBackgroundNotifications(p, cfg.BackgroundManager, cfg.Identity.BotID, cfg.Identity.SessionID, a.logger)
+			return p
+		}
+	}
+
 	opts := a.buildGenerateOptions(cfg, sdkTools, prepareStep)
 	opts = append(opts,
 		sdk.WithOnStep(func(step *sdk.StepResult) *sdk.GenerateParams {
@@ -499,6 +531,29 @@ func toolStreamEventToAgentEvent(evt tools.ToolStreamEvent) StreamEvent {
 	default:
 		return StreamEvent{}
 	}
+}
+
+// drainBackgroundNotifications non-blockingly drains pending background task
+// notifications for the given bot+session and injects them as user messages
+// into the next LLM step. This follows the same pattern as Claude Code's
+// task-notification injection via query() at step boundaries.
+func drainBackgroundNotifications(
+	p *sdk.GenerateParams,
+	mgr *background.Manager,
+	botID, sessionID string,
+	logger *slog.Logger,
+) *sdk.GenerateParams {
+	notifications := mgr.DrainNotifications(botID, sessionID)
+	for _, n := range notifications {
+		text := fmt.Sprintf("A background task completed:\n%s", n.FormatForAgent())
+		p.Messages = append(p.Messages, sdk.UserMessage(text))
+		logger.Info("injected background task notification",
+			slog.String("task_id", n.TaskID),
+			slog.String("status", string(n.Status)),
+			slog.String("bot_id", botID),
+		)
+	}
+	return p
 }
 
 func wrapToolsWithLoopGuard(tools []sdk.Tool, guard *ToolLoopGuard, abortCallIDs map[string]struct{}) []sdk.Tool {

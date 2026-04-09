@@ -19,6 +19,7 @@ import (
 
 	"github.com/memohai/memoh/internal/accounts"
 	agentpkg "github.com/memohai/memoh/internal/agent"
+	"github.com/memohai/memoh/internal/agent/background"
 	"github.com/memohai/memoh/internal/compaction"
 	"github.com/memohai/memoh/internal/conversation"
 	"github.com/memohai/memoh/internal/db/sqlc"
@@ -74,6 +75,7 @@ type Resolver struct {
 	skillLoader       SkillLoader
 	assetLoader       gatewayAssetLoader
 	pipeline          *pipelinepkg.Pipeline
+	bgManager         *background.Manager
 	timeout           time.Duration
 	clockLocation     *time.Location
 	logger            *slog.Logger
@@ -131,6 +133,12 @@ func (r *Resolver) SetGatewayAssetLoader(loader gatewayAssetLoader) {
 // SetCompactionService configures the compaction service for context compaction.
 func (r *Resolver) SetCompactionService(s *compaction.Service) {
 	r.compactionService = s
+}
+
+// SetBackgroundManager configures the background task manager so that
+// background exec notifications are injected into the agent loop.
+func (r *Resolver) SetBackgroundManager(m *background.Manager) {
+	r.bgManager = m
 }
 
 // SetPipeline configures the DCP pipeline for RC-based context assembly.
@@ -435,8 +443,9 @@ func (r *Resolver) buildBaseRunConfig(ctx context.Context, p baseRunConfigParams
 			TimezoneLocation:  userClockLocation,
 			SessionToken:      p.SessionToken,
 		},
-		Skills:        agentSkills,
-		LoopDetection: agentpkg.LoopDetectionConfig{Enabled: loopDetectionEnabled},
+		Skills:            agentSkills,
+		LoopDetection:     agentpkg.LoopDetectionConfig{Enabled: loopDetectionEnabled},
+		BackgroundManager: r.bgManager,
 	}
 
 	return cfg, chatModel, provider, nil

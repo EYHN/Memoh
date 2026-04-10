@@ -15,6 +15,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"regexp"
 	"sync"
 	"time"
 
@@ -31,6 +32,12 @@ const (
 	// OutputLogDir is the directory inside the container where background
 	// task output logs are written.
 	OutputLogDir = "/tmp/memoh-bg"
+
+	// stallCheckInterval is how often the stall watchdog checks output growth.
+	stallCheckInterval = 5 * time.Second
+	// stallThreshold is the duration of zero output growth before we consider
+	// the command stalled and possibly waiting for interactive input.
+	stallThreshold = 45 * time.Second
 )
 
 // ExecFunc executes a command in a container and returns the result.
@@ -42,11 +49,11 @@ type WriteFileFunc func(ctx context.Context, path string, data []byte) error
 
 // Manager tracks background tasks and delivers completion notifications.
 type Manager struct {
-	mu     sync.Mutex
-	tasks  map[string]*Task // taskID -> Task
-	notify chan Notification // buffered notification channel
-	seq    uint64           // monotonic task ID counter
-	logger *slog.Logger
+	mu            sync.Mutex
+	tasks         map[string]*Task   // taskID -> Task
+	notifications []Notification     // pending notifications, protected by mu
+	seq           uint64             // monotonic task ID counter
+	logger        *slog.Logger
 }
 
 // New creates a new background task Manager.
@@ -56,7 +63,6 @@ func New(logger *slog.Logger) *Manager {
 	}
 	return &Manager{
 		tasks:  make(map[string]*Task),
-		notify: make(chan Notification, 64),
 		logger: logger.With(slog.String("service", "background")),
 	}
 }
@@ -101,6 +107,136 @@ func (m *Manager) Spawn(
 	return taskID
 }
 
+// SpawnAdopt registers a background task for a command that is already running
+// externally (e.g. via ExecStream). Instead of re-executing the command, it
+// waits for the result on the provided channel. This enables "flip to background"
+// where a foreground stream is handed off without killing the process.
+func (m *Manager) SpawnAdopt(
+	botID, sessionID, command, workDir, description string,
+	resultCh <-chan AdoptResult,
+	writeFn WriteFileFunc,
+) (taskID, outputFile string) {
+	m.mu.Lock()
+	m.seq++
+	taskID = fmt.Sprintf("bg_%s_%d", botID[:min(8, len(botID))], m.seq)
+	outputFile = fmt.Sprintf("%s/%s.log", OutputLogDir, taskID)
+
+	task := &Task{
+		ID:          taskID,
+		BotID:       botID,
+		SessionID:   sessionID,
+		Command:     command,
+		Description: description,
+		WorkDir:     workDir,
+		Status:      TaskRunning,
+		OutputFile:  outputFile,
+		StartedAt:   time.Now(),
+	}
+	m.tasks[taskID] = task
+	m.mu.Unlock()
+
+	m.logger.Info("background task adopted",
+		slog.String("task_id", taskID),
+		slog.String("bot_id", botID),
+		slog.String("command", truncate(command, 120)),
+	)
+
+	go m.runAdopt(task, resultCh, writeFn)
+	return taskID, outputFile
+}
+
+// runAdopt waits for the adopted stream result and handles completion.
+func (m *Manager) runAdopt(task *Task, resultCh <-chan AdoptResult, writeFn WriteFileFunc) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(BackgroundExecTimeout)*time.Second)
+	task.mu.Lock()
+	task.cancel = cancel
+	task.mu.Unlock()
+	defer cancel()
+
+	// Ensure output directory exists.
+	_ = m.ensureOutputDir(ctx, task, writeFn)
+
+	// Start stall watchdog.
+	go m.stallWatchdog(ctx, task)
+
+	// Wait for the result from the already-running stream.
+	var result AdoptResult
+	select {
+	case result = <-resultCh:
+	case <-ctx.Done():
+		result = AdoptResult{Err: ctx.Err()}
+	}
+
+	// Collect output.
+	if result.Err != nil {
+		task.AppendOutput(fmt.Sprintf("[error] %v\n", result.Err))
+	} else {
+		task.AppendOutput(result.Stdout)
+		if result.Stderr != "" {
+			task.AppendOutput(result.Stderr)
+		}
+	}
+
+	// Write output to log file in container.
+	if writeFn != nil && result.Err == nil {
+		combined := result.Stdout
+		if result.Stderr != "" {
+			combined += "\n--- stderr ---\n" + result.Stderr
+		}
+		_ = writeFn(context.Background(), task.OutputFile, []byte(combined))
+	}
+
+	task.mu.Lock()
+	if task.Status == TaskKilled {
+		task.mu.Unlock()
+		return
+	}
+	task.CompletedAt = time.Now()
+	if result.Err != nil {
+		task.Status = TaskFailed
+		task.ExitCode = -1
+	} else {
+		task.ExitCode = result.ExitCode
+		if result.ExitCode == 0 {
+			task.Status = TaskCompleted
+		} else {
+			task.Status = TaskFailed
+		}
+	}
+	status := task.Status
+	exitCode := task.ExitCode
+	task.mu.Unlock()
+
+	duration := task.CompletedAt.Sub(task.StartedAt)
+	m.logger.Info("adopted background task finished",
+		slog.String("task_id", task.ID),
+		slog.String("status", string(status)),
+		slog.Int("exit_code", int(exitCode)),
+		slog.Duration("duration", duration),
+	)
+
+	if !task.MarkNotified() {
+		return
+	}
+
+	n := Notification{
+		TaskID:      task.ID,
+		BotID:       task.BotID,
+		SessionID:   task.SessionID,
+		Status:      status,
+		Command:     task.Command,
+		Description: task.Description,
+		ExitCode:    exitCode,
+		OutputFile:  task.OutputFile,
+		OutputTail:  task.OutputTail(),
+		Duration:    duration,
+	}
+
+	m.mu.Lock()
+	m.notifications = append(m.notifications, n)
+	m.mu.Unlock()
+}
+
 func (m *Manager) run(task *Task, execFn ExecFunc, writeFn WriteFileFunc) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(BackgroundExecTimeout)*time.Second)
 	task.mu.Lock()
@@ -111,12 +247,15 @@ func (m *Manager) run(task *Task, execFn ExecFunc, writeFn WriteFileFunc) {
 	// Ensure output directory exists.
 	_ = m.ensureOutputDir(ctx, task, writeFn)
 
+	// Start stall watchdog to detect commands waiting for interactive input.
+	go m.stallWatchdog(ctx, task)
+
 	// Wrap command to tee output to the log file inside the container.
 	// This way, even if the agent wants to read partial output mid-run,
 	// it can use the read tool on the output file.
 	wrappedCmd := fmt.Sprintf(
-		"{ %s ; } > >(tee -a %s) 2>&1; echo \"exit_code=$?\" >> %s",
-		task.Command, task.OutputFile, task.OutputFile,
+		"{ %s ; } 2>&1 | tee -a %s",
+		task.Command, task.OutputFile,
 	)
 
 	result, err := execFn(ctx, wrappedCmd, task.WorkDir, BackgroundExecTimeout)
@@ -132,6 +271,11 @@ func (m *Manager) run(task *Task, execFn ExecFunc, writeFn WriteFileFunc) {
 	}
 
 	task.mu.Lock()
+	// If the task was already killed, don't overwrite its status.
+	if task.Status == TaskKilled {
+		task.mu.Unlock()
+		return
+	}
 	task.CompletedAt = time.Now()
 	if err != nil {
 		task.Status = TaskFailed
@@ -148,15 +292,6 @@ func (m *Manager) run(task *Task, execFn ExecFunc, writeFn WriteFileFunc) {
 	exitCode := task.ExitCode
 	task.mu.Unlock()
 
-	// Write final output to the log file as well.
-	if writeFn != nil && result != nil {
-		combined := result.Stdout
-		if result.Stderr != "" {
-			combined += "\n--- stderr ---\n" + result.Stderr
-		}
-		_ = writeFn(context.Background(), task.OutputFile, []byte(combined))
-	}
-
 	duration := task.CompletedAt.Sub(task.StartedAt)
 	m.logger.Info("background task finished",
 		slog.String("task_id", task.ID),
@@ -165,7 +300,11 @@ func (m *Manager) run(task *Task, execFn ExecFunc, writeFn WriteFileFunc) {
 		slog.Duration("duration", duration),
 	)
 
-	// Enqueue notification for the agent loop to pick up.
+	// Enqueue notification unless already notified (e.g. by Kill or auto-background race).
+	if !task.MarkNotified() {
+		return
+	}
+
 	n := Notification{
 		TaskID:      task.ID,
 		BotID:       task.BotID,
@@ -179,13 +318,9 @@ func (m *Manager) run(task *Task, execFn ExecFunc, writeFn WriteFileFunc) {
 		Duration:    duration,
 	}
 
-	select {
-	case m.notify <- n:
-	default:
-		m.logger.Warn("notification channel full, dropping",
-			slog.String("task_id", task.ID),
-		)
-	}
+	m.mu.Lock()
+	m.notifications = append(m.notifications, n)
+	m.mu.Unlock()
 }
 
 func (m *Manager) ensureOutputDir(ctx context.Context, task *Task, writeFn WriteFileFunc) error {
@@ -238,42 +373,23 @@ func (m *Manager) ListForSession(botID, sessionID string) []*Task {
 	return result
 }
 
-// Notifications returns the channel that delivers task completion events.
-// The agent loop should drain this channel at step boundaries.
-func (m *Manager) Notifications() <-chan Notification {
-	return m.notify
-}
-
 // DrainNotifications returns all pending notifications for a given
 // bot+session without blocking. Used by the resolver to inject
 // notifications at the start of a new agent run.
 func (m *Manager) DrainNotifications(botID, sessionID string) []Notification {
-	// Drain everything from the channel first, then re-enqueue non-matching.
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
 	var matched []Notification
-	var others []Notification
-	for {
-		select {
-		case n := <-m.notify:
-			if n.BotID == botID && n.SessionID == sessionID {
-				matched = append(matched, n)
-			} else {
-				others = append(others, n)
-			}
-		default:
-			goto done
+	remaining := m.notifications[:0] // reuse backing array
+	for _, n := range m.notifications {
+		if n.BotID == botID && n.SessionID == sessionID {
+			matched = append(matched, n)
+		} else {
+			remaining = append(remaining, n)
 		}
 	}
-done:
-	// Put non-matching notifications back.
-	for _, n := range others {
-		select {
-		case m.notify <- n:
-		default:
-			m.logger.Warn("notification re-enqueue failed",
-				slog.String("task_id", n.TaskID),
-			)
-		}
-	}
+	m.notifications = remaining
 	return matched
 }
 
@@ -312,6 +428,94 @@ func (m *Manager) Cleanup(maxAge time.Duration) {
 		if t.Status != TaskRunning && t.CompletedAt.Before(cutoff) {
 			delete(m.tasks, id)
 		}
+	}
+}
+
+// promptPatterns matches common interactive prompt endings that indicate
+// a command is waiting for user input.
+var promptPatterns = regexp.MustCompile(
+	`(?i)(\$ ?$|> ?$|# ?$|password\s*:|passphrase\s*:|y/n\]|yes/no\)|enter .*:|Press .* to continue|Are you sure|Continue\?|Proceed\?)`,
+)
+
+// stallWatchdog monitors a background task's output for stalls that might
+// indicate the command is waiting for interactive input. If detected, it
+// enqueues a notification advising the agent to kill and retry.
+func (m *Manager) stallWatchdog(ctx context.Context, task *Task) {
+	ticker := time.NewTicker(stallCheckInterval)
+	defer ticker.Stop()
+
+	var lastLen int
+	var stalledSince time.Time
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+
+		task.mu.Lock()
+		if task.Status != TaskRunning {
+			task.mu.Unlock()
+			return
+		}
+		currentLen := task.output.Len()
+		// Read tail inline (we already hold the lock).
+		tail := task.output.String()
+		if len(tail) > maxTailBytes {
+			tail = tail[len(tail)-maxTailBytes:]
+		}
+		task.mu.Unlock()
+
+		if currentLen != lastLen {
+			// Output is still growing — reset stall timer.
+			lastLen = currentLen
+			stalledSince = time.Time{}
+			continue
+		}
+
+		// Output hasn't grown.
+		if stalledSince.IsZero() {
+			stalledSince = time.Now()
+			continue
+		}
+
+		if time.Since(stalledSince) < stallThreshold {
+			continue
+		}
+
+		// Stalled long enough. Check if the tail looks like an interactive prompt.
+		if !promptPatterns.MatchString(tail) {
+			continue
+		}
+
+		m.logger.Warn("background task appears stalled on interactive prompt",
+			slog.String("task_id", task.ID),
+		)
+
+		// Enqueue a stall notification (only once).
+		if !task.MarkNotified() {
+			return
+		}
+
+		n := Notification{
+			TaskID:      task.ID,
+			BotID:       task.BotID,
+			SessionID:   task.SessionID,
+			Status:      TaskRunning, // still running, but stalled
+			Command:     task.Command,
+			Description: task.Description,
+			ExitCode:    0,
+			OutputFile:  task.OutputFile,
+			OutputTail:  tail,
+			Duration:    time.Since(task.StartedAt),
+			Stalled:     true,
+		}
+
+		m.mu.Lock()
+		m.notifications = append(m.notifications, n)
+		m.mu.Unlock()
+		return // only notify once per task
 	}
 }
 

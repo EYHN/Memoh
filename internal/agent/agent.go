@@ -161,13 +161,14 @@ func (a *Agent) runStream(ctx context.Context, cfg RunConfig, ch chan<- StreamEv
 	// discovers completed background work naturally.
 	if cfg.BackgroundManager != nil {
 		basePrepare := prepareStep
+		baseSystem := cfg.System // capture original system prompt to avoid accumulation
 		prepareStep = func(p *sdk.GenerateParams) *sdk.GenerateParams {
 			if basePrepare != nil {
 				if override := basePrepare(p); override != nil {
 					p = override
 				}
 			}
-			p = drainBackgroundNotifications(p, cfg.BackgroundManager, cfg.Identity.BotID, cfg.Identity.SessionID, a.logger)
+			p = drainBackgroundNotifications(p, cfg.BackgroundManager, baseSystem, cfg.Identity.BotID, cfg.Identity.SessionID, a.logger)
 			return p
 		}
 	}
@@ -361,13 +362,14 @@ func (a *Agent) runGenerate(ctx context.Context, cfg RunConfig) (*GenerateResult
 	// Drain background task notifications at step boundaries (non-streaming).
 	if cfg.BackgroundManager != nil {
 		basePrepare := prepareStep
+		baseSystem := cfg.System
 		prepareStep = func(p *sdk.GenerateParams) *sdk.GenerateParams {
 			if basePrepare != nil {
 				if override := basePrepare(p); override != nil {
 					p = override
 				}
 			}
-			p = drainBackgroundNotifications(p, cfg.BackgroundManager, cfg.Identity.BotID, cfg.Identity.SessionID, a.logger)
+			p = drainBackgroundNotifications(p, cfg.BackgroundManager, baseSystem, cfg.Identity.BotID, cfg.Identity.SessionID, a.logger)
 			return p
 		}
 	}
@@ -540,16 +542,33 @@ func toolStreamEventToAgentEvent(evt tools.ToolStreamEvent) StreamEvent {
 func drainBackgroundNotifications(
 	p *sdk.GenerateParams,
 	mgr *background.Manager,
+	baseSystem string,
 	botID, sessionID string,
 	logger *slog.Logger,
 ) *sdk.GenerateParams {
+	// Inject running tasks summary into system prompt so the model
+	// knows about ongoing background work even after compaction.
+	// Always start from baseSystem to avoid accumulating summaries across steps.
+	if summary := mgr.RunningTasksSummary(botID, sessionID); summary != "" {
+		p.System = baseSystem + "\n\n" + summary
+	} else {
+		p.System = baseSystem
+	}
+
 	notifications := mgr.DrainNotifications(botID, sessionID)
 	for _, n := range notifications {
-		text := fmt.Sprintf("A background task completed:\n%s", n.FormatForAgent())
+		var prefix string
+		if n.Stalled {
+			prefix = "A background task appears stuck and may need attention:"
+		} else {
+			prefix = "A background task completed:"
+		}
+		text := fmt.Sprintf("%s\n%s", prefix, n.FormatForAgent())
 		p.Messages = append(p.Messages, sdk.UserMessage(text))
 		logger.Info("injected background task notification",
 			slog.String("task_id", n.TaskID),
 			slog.String("status", string(n.Status)),
+			slog.Bool("stalled", n.Stalled),
 			slog.String("bot_id", botID),
 		)
 	}

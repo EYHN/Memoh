@@ -32,9 +32,22 @@ type Task struct {
 	StartedAt   time.Time
 	CompletedAt time.Time
 
-	mu     sync.Mutex
-	cancel context.CancelFunc
-	output strings.Builder // buffered output tail
+	mu       sync.Mutex
+	cancel   context.CancelFunc
+	notified bool            // true once a notification has been enqueued; prevents duplicates
+	output   strings.Builder // buffered output tail
+}
+
+// MarkNotified atomically sets the notified flag. Returns true if this call
+// was the one that flipped it (i.e., the caller should enqueue the notification).
+func (t *Task) MarkNotified() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.notified {
+		return false
+	}
+	t.notified = true
+	return true
 }
 
 // Cancel requests cancellation of the task's context.
@@ -77,8 +90,17 @@ func (t *Task) OutputTail() string {
 
 const maxTailBytes = 4096
 
+// AdoptResult carries the outcome of a command whose execution was started
+// externally (e.g. via ExecStream) and then handed off to the Manager.
+type AdoptResult struct {
+	Stdout   string
+	Stderr   string
+	ExitCode int32
+	Err      error
+}
+
 // Notification is the structured event sent to the agent when a background
-// task reaches a terminal state.
+// task reaches a terminal state or requires attention (e.g. stalled).
 type Notification struct {
 	TaskID      string
 	BotID       string
@@ -90,6 +112,7 @@ type Notification struct {
 	OutputFile  string
 	OutputTail  string // last N bytes of output for quick summary
 	Duration    time.Duration
+	Stalled     bool // true when task appears stuck on interactive input
 }
 
 // FormatForAgent returns a human-readable task-notification block that can be
@@ -99,18 +122,27 @@ func (n Notification) FormatForAgent() string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "<task-notification>\n")
 	fmt.Fprintf(&b, "  <task-id>%s</task-id>\n", n.TaskID)
-	fmt.Fprintf(&b, "  <status>%s</status>\n", n.Status)
+	if n.Stalled {
+		fmt.Fprintf(&b, "  <status>stalled</status>\n")
+	} else {
+		fmt.Fprintf(&b, "  <status>%s</status>\n", n.Status)
+	}
 	fmt.Fprintf(&b, "  <command>%s</command>\n", n.Command)
 	if n.Description != "" {
 		fmt.Fprintf(&b, "  <description>%s</description>\n", n.Description)
 	}
-	fmt.Fprintf(&b, "  <exit-code>%d</exit-code>\n", n.ExitCode)
+	if !n.Stalled {
+		fmt.Fprintf(&b, "  <exit-code>%d</exit-code>\n", n.ExitCode)
+	}
 	fmt.Fprintf(&b, "  <duration>%s</duration>\n", n.Duration.Round(time.Millisecond))
 	if n.OutputFile != "" {
 		fmt.Fprintf(&b, "  <output-file>%s</output-file>\n", n.OutputFile)
 	}
 	if n.OutputTail != "" {
 		fmt.Fprintf(&b, "  <output-tail>\n%s\n  </output-tail>\n", strings.TrimRight(n.OutputTail, "\n"))
+	}
+	if n.Stalled {
+		fmt.Fprintf(&b, "  <suggestion>This command appears to be waiting for interactive input. Kill it with bg_status and retry with a non-interactive flag (e.g. -y, --yes, --non-interactive).</suggestion>\n")
 	}
 	fmt.Fprintf(&b, "</task-notification>")
 	return b.String()

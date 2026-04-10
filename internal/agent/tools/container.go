@@ -7,13 +7,21 @@ import (
 	"io"
 	"log/slog"
 	"math"
+	"regexp"
+	"strconv"
 	"strings"
+	"time"
 
 	sdk "github.com/memohai/twilight-ai/sdk"
 
 	"github.com/memohai/memoh/internal/agent/background"
 	"github.com/memohai/memoh/internal/workspace/bridge"
+	pb "github.com/memohai/memoh/internal/workspace/bridgepb"
 )
+
+// blockedSleepPattern matches standalone `sleep N` where N >= 2.
+// Does not match sleep inside pipelines, subshells, or scripts.
+var blockedSleepPattern = regexp.MustCompile(`^sleep\s+(\d+(?:\.\d+)?)(?:\s*[;&]|$)`)
 
 const defaultContainerExecWorkDir = "/data"
 
@@ -115,18 +123,23 @@ func (p *ContainerProvider) Tools(_ context.Context, session SessionContext) ([]
 
 # Instructions
 - Use this tool to run shell commands for installing packages, running scripts, building code, running tests, and other system operations.
-- If your command will take a long time (package installs, builds, test suites), set run_in_background to true. You will be notified when it completes.
+- If your command will take a long time (package installs, builds, test suites), set run_in_background to true. You will be notified when it completes. You do not need to add '&' at the end of the command when using this parameter.
 - If waiting for a background task, you will be notified when it completes — do NOT poll or sleep.
-- You may specify a custom timeout (up to %d seconds) for commands you know will take longer than the default %d seconds.
-- Avoid unnecessary sleep commands — if you need to wait for a background task, you will be notified automatically.`, wd, background.MaxExecTimeout, background.DefaultExecTimeout),
+- You may specify a custom timeout (up to %d seconds) for commands you know will take longer than the default %d seconds. If a foreground command times out, it will be automatically moved to the background and you will be notified when it completes.
+- Avoid unnecessary sleep commands:
+  - Do not sleep between commands that can run immediately — just run them.
+  - If your command is long running, use run_in_background. No sleep needed.
+  - Do not retry failing commands in a sleep loop — diagnose the root cause.
+  - If waiting for a background task, you will be notified when it completes — do not poll.
+  - sleep N (N >= 2) in foreground is blocked. If you genuinely need a short delay, keep it under 2 seconds.`, wd, background.MaxExecTimeout, background.DefaultExecTimeout),
 			Parameters: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
-					"command":           map[string]any{"type": "string", "description": "Shell command to run (e.g. ls -la, npm install, python script.py)"},
-					"work_dir":          map[string]any{"type": "string", "description": fmt.Sprintf("Working directory inside the container (default: %s)", wd)},
-					"description":       map[string]any{"type": "string", "description": "Short description of what this command does (shown in task status)"},
-					"timeout":           map[string]any{"type": "integer", "description": fmt.Sprintf("Timeout in seconds (default: %d, max: %d). Only applies to foreground execution.", background.DefaultExecTimeout, background.MaxExecTimeout), "minimum": 1, "maximum": background.MaxExecTimeout},
-					"run_in_background": map[string]any{"type": "boolean", "description": "If true, run the command in the background. Returns immediately with a task ID. You will be notified when it completes. Use for long-running commands (installs, builds, test suites)."},
+					"command":   map[string]any{"type": "string", "description": "Shell command to run (e.g. ls -la, npm install, python script.py)"},
+					"work_dir":  map[string]any{"type": "string", "description": fmt.Sprintf("Working directory inside the container (default: %s)", wd)},
+					"description": map[string]any{"type": "string", "description": `Clear, concise description of what this command does in active voice. For simple commands keep it brief (5-10 words): ls -la → "List files with details". For complex commands add enough context: curl -s url | jq '.data[]' → "Fetch JSON and extract data array".`},
+					"timeout":           map[string]any{"type": "integer", "description": fmt.Sprintf("Timeout in seconds (default: %d, max: %d). Only applies to foreground execution. Commands that exceed this timeout are automatically moved to background.", background.DefaultExecTimeout, background.MaxExecTimeout), "minimum": 1, "maximum": background.MaxExecTimeout},
+					"run_in_background": map[string]any{"type": "boolean", "description": "If true, run the command in the background. Returns immediately with a task ID. You will be notified when it completes. Use for long-running commands (installs, builds, test suites). You do not need to use '&' at the end of the command."},
 				},
 				"required": []string{"command"},
 			},
@@ -374,13 +387,26 @@ func (p *ContainerProvider) execExec(ctx context.Context, session SessionContext
 		timeout = int32(t) //nolint:gosec // bounded above
 	}
 
-	// Background execution path.
+	// Block sleep N (N>=2) in foreground — nudge model toward run_in_background.
 	runInBg, _, _ := BoolArg(args, "run_in_background")
+	if !runInBg {
+		if reason := detectBlockedSleep(command); reason != "" {
+			return nil, fmt.Errorf("blocked: %s. Use run_in_background: true for long-running commands — you will get a completion notification when done. If you genuinely need a short delay, keep it under 2 seconds", reason)
+		}
+	}
+
+	// Background execution path.
 	if runInBg && p.bgManager != nil {
 		return p.execExecBackground(ctx, session, client, command, workDir, description)
 	}
 
-	// Foreground execution with configurable timeout.
+	// If we have a background manager, use streaming exec so we can flip
+	// to background on timeout without killing the process.
+	if p.bgManager != nil {
+		return p.execExecWithFlip(ctx, session, client, command, workDir, description, timeout)
+	}
+
+	// Fallback: no background manager, plain synchronous exec.
 	result, err := client.Exec(ctx, command, workDir, timeout)
 	if err != nil {
 		return nil, err
@@ -390,11 +416,134 @@ func (p *ContainerProvider) execExec(ctx context.Context, session SessionContext
 	return map[string]any{"stdout": stdout, "stderr": stderr, "exit_code": result.ExitCode}, nil
 }
 
-// execExecBackground spawns the command as a background task and returns immediately.
-func (p *ContainerProvider) execExecBackground(
-	_ context.Context, session SessionContext, client *bridge.Client,
-	command, workDir, description string,
+// execExecWithFlip runs a command via ExecStream with a client-side soft timeout.
+// If the command finishes within the timeout, it returns the result normally.
+// If the soft timeout fires first, the running stream is handed off to the
+// background manager — the process keeps running in the container, and the
+// agent gets an immediate "auto_backgrounded" response.
+func (p *ContainerProvider) execExecWithFlip(
+	ctx context.Context, session SessionContext, client *bridge.Client,
+	command, workDir, description string, softTimeout int32,
 ) (any, error) {
+	// Start streaming exec with a large container-side timeout so the process
+	// keeps running even after we stop reading in the foreground.
+	stream, err := client.ExecStream(ctx, command, workDir, background.BackgroundExecTimeout)
+	if err != nil {
+		return nil, err
+	}
+
+	resultCh := make(chan background.AdoptResult, 1)
+	go func() {
+		var stdout, stderr strings.Builder
+		var exitCode int32
+		for {
+			msg, err := stream.Recv()
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			if err != nil {
+				resultCh <- background.AdoptResult{Err: err}
+				return
+			}
+			switch msg.GetStream() {
+			case pb.ExecOutput_STDOUT:
+				stdout.Write(msg.GetData())
+			case pb.ExecOutput_STDERR:
+				stderr.Write(msg.GetData())
+			case pb.ExecOutput_EXIT:
+				exitCode = msg.GetExitCode()
+			}
+		}
+		resultCh <- background.AdoptResult{
+			Stdout:   stdout.String(),
+			Stderr:   stderr.String(),
+			ExitCode: exitCode,
+		}
+	}()
+
+	// Wait for either the result or soft timeout.
+	timer := time.NewTimer(time.Duration(softTimeout) * time.Second)
+	defer timer.Stop()
+
+	select {
+	case r := <-resultCh:
+		// Command finished within the soft timeout — return normally.
+		if r.Err != nil {
+			return nil, r.Err
+		}
+		stdout := pruneToolOutputText(r.Stdout, "tool result (exec stdout)")
+		stderr := pruneToolOutputText(r.Stderr, "tool result (exec stderr)")
+		return map[string]any{"stdout": stdout, "stderr": stderr, "exit_code": r.ExitCode}, nil
+
+	case <-timer.C:
+		// Soft timeout fired — flip the running stream to background.
+		// The container process is still alive; we hand off the stream reader
+		// goroutine to the background manager.
+		return p.flipToBackground(session, client, resultCh, command, workDir, description, softTimeout)
+
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// flipToBackground registers the already-running stream as a background task.
+// The goroutine reading from the stream continues; its result feeds the task.
+func (p *ContainerProvider) flipToBackground(
+	session SessionContext, client *bridge.Client,
+	resultCh <-chan background.AdoptResult,
+	command, workDir, description string, softTimeout int32,
+) (any, error) {
+	writeFn := func(ctx context.Context, path string, data []byte) error {
+		return client.WriteFile(ctx, path, data)
+	}
+
+	taskID, outputFile := p.bgManager.SpawnAdopt(
+		session.BotID, session.SessionID,
+		command, workDir, description,
+		resultCh, writeFn,
+	)
+
+	p.logger.Info("foreground exec flipped to background",
+		slog.String("task_id", taskID),
+		slog.String("command", truncateStr(command, 120)),
+		slog.Int("soft_timeout_seconds", int(softTimeout)),
+	)
+
+	return map[string]any{
+		"status":      "auto_backgrounded",
+		"task_id":     taskID,
+		"output_file": outputFile,
+		"message": fmt.Sprintf(
+			"Command exceeded the foreground timeout (%ds) and has been moved to the background with task ID: %s. "+
+				"The process is still running — no work was lost. "+
+				"You will be notified when it completes. Output is being written to: %s. "+
+				"For long-running commands, use run_in_background: true from the start to avoid this delay.",
+			softTimeout, taskID, outputFile,
+		),
+	}, nil
+}
+
+// detectBlockedSleep checks if the command starts with `sleep N` where N >= 2.
+// Returns a human-readable reason string, or "" if the command is allowed.
+func detectBlockedSleep(command string) string {
+	cmd := strings.TrimSpace(command)
+	m := blockedSleepPattern.FindStringSubmatch(cmd)
+	if m == nil {
+		return ""
+	}
+	seconds, err := strconv.ParseFloat(m[1], 64)
+	if err != nil || seconds < 2 {
+		return ""
+	}
+	return fmt.Sprintf("sleep %.0f is not allowed in foreground execution", seconds)
+}
+
+// spawnBackground is the shared helper that registers a background task and
+// returns (taskID, outputFile). Used by both explicit and auto-background paths.
+func (p *ContainerProvider) spawnBackground(
+	session SessionContext, client *bridge.Client,
+	command, workDir, description string,
+) (taskID, outputFile string) {
 	execFn := func(ctx context.Context, cmd, wd string, timeout int32) (*bridge.ExecResult, error) {
 		return client.Exec(ctx, cmd, wd, timeout)
 	}
@@ -402,17 +551,24 @@ func (p *ContainerProvider) execExecBackground(
 		return client.WriteFile(ctx, path, data)
 	}
 
-	taskID := p.bgManager.Spawn(
+	taskID = p.bgManager.Spawn(
 		session.BotID, session.SessionID,
 		command, workDir, description,
 		execFn, writeFn,
 	)
 
-	task := p.bgManager.Get(taskID)
-	outputFile := ""
-	if task != nil {
+	if task := p.bgManager.Get(taskID); task != nil {
 		outputFile = task.OutputFile
 	}
+	return taskID, outputFile
+}
+
+// execExecBackground spawns the command as a background task and returns immediately.
+func (p *ContainerProvider) execExecBackground(
+	_ context.Context, session SessionContext, client *bridge.Client,
+	command, workDir, description string,
+) (any, error) {
+	taskID, outputFile := p.spawnBackground(session, client, command, workDir, description)
 
 	return map[string]any{
 		"status":      "background_started",

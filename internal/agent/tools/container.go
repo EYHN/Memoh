@@ -391,7 +391,7 @@ func (p *ContainerProvider) execExec(ctx context.Context, session SessionContext
 	runInBg, _, _ := BoolArg(args, "run_in_background")
 	if !runInBg {
 		if reason := detectBlockedSleep(command); reason != "" {
-			return nil, fmt.Errorf("blocked: %s. Use run_in_background: true for long-running commands — you will get a completion notification when done. If you genuinely need a short delay, keep it under 2 seconds", reason)
+			return nil, fmt.Errorf("blocked: %s. Run blocking commands in the background with run_in_background: true — you'll get a completion notification when done. If you genuinely need a delay (rate limiting, deliberate pacing), keep it under 2 seconds", reason)
 		}
 	}
 

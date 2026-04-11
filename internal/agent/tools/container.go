@@ -427,7 +427,10 @@ func (p *ContainerProvider) execExecWithFlip(
 ) (any, error) {
 	// Start streaming exec with a large container-side timeout so the process
 	// keeps running even after we stop reading in the foreground.
-	stream, err := client.ExecStream(ctx, command, workDir, background.BackgroundExecTimeout)
+	// Use context.WithoutCancel so the gRPC stream is not killed when the
+	// foreground agent context ends (e.g. session completes while the command
+	// is still running and about to be flipped to background).
+	stream, err := client.ExecStream(context.WithoutCancel(ctx), command, workDir, background.BackgroundExecTimeout)
 	if err != nil {
 		return nil, err
 	}
@@ -498,7 +501,7 @@ func (p *ContainerProvider) flipToBackground(
 	}
 
 	taskID, outputFile := p.bgManager.SpawnAdopt(
-		session.BotID, session.SessionID,
+		session.BotID, session.SessionID, session.CurrentPlatform, session.ReplyTarget,
 		command, workDir, description,
 		resultCh, writeFn,
 	)
@@ -550,11 +553,18 @@ func (p *ContainerProvider) spawnBackground(
 	writeFn := func(ctx context.Context, path string, data []byte) error {
 		return client.WriteFile(ctx, path, data)
 	}
+	readFn := func(ctx context.Context, path string) ([]byte, error) {
+		resp, err := client.ReadFile(ctx, path, 1, 10)
+		if err != nil {
+			return nil, err
+		}
+		return []byte(resp.GetContent()), nil
+	}
 
 	taskID = p.bgManager.Spawn(
-		session.BotID, session.SessionID,
+		session.BotID, session.SessionID, session.CurrentPlatform, session.ReplyTarget,
 		command, workDir, description,
-		execFn, writeFn,
+		execFn, writeFn, readFn,
 	)
 
 	if task := p.bgManager.Get(taskID); task != nil {
@@ -659,3 +669,4 @@ func addLineNumbers(content string, startLine int32) string {
 	}
 	return out.String()
 }
+

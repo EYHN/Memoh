@@ -20,17 +20,19 @@ const (
 
 // Task represents a single background command execution.
 type Task struct {
-	ID          string
-	BotID       string
-	SessionID   string
-	Command     string
-	Description string
-	WorkDir     string
-	Status      TaskStatus
-	ExitCode    int32
-	OutputFile  string // path inside container where output is being written
-	StartedAt   time.Time
-	CompletedAt time.Time
+	ID              string
+	BotID           string
+	SessionID       string
+	CurrentPlatform string // channel type (e.g. "telegram") for proactive delivery
+	ReplyTarget     string // channel target (e.g. Telegram chat ID) for proactive delivery
+	Command         string
+	Description     string
+	WorkDir         string
+	Status          TaskStatus
+	ExitCode        int32
+	OutputFile      string // path inside container where output is being written
+	StartedAt       time.Time
+	CompletedAt     time.Time
 
 	mu       sync.Mutex
 	cancel   context.CancelFunc
@@ -102,17 +104,19 @@ type AdoptResult struct {
 // Notification is the structured event sent to the agent when a background
 // task reaches a terminal state or requires attention (e.g. stalled).
 type Notification struct {
-	TaskID      string
-	BotID       string
-	SessionID   string
-	Status      TaskStatus
-	Command     string
-	Description string
-	ExitCode    int32
-	OutputFile  string
-	OutputTail  string // last N bytes of output for quick summary
-	Duration    time.Duration
-	Stalled     bool // true when task appears stuck on interactive input
+	TaskID          string
+	BotID           string
+	SessionID       string
+	CurrentPlatform string // channel type for proactive delivery
+	ReplyTarget     string // channel target for proactive delivery
+	Status          TaskStatus
+	Command         string
+	Description     string
+	ExitCode        int32
+	OutputFile      string
+	OutputTail      string // last N bytes of output for quick summary
+	Duration        time.Duration
+	Stalled         bool // true when task appears stuck on interactive input
 }
 
 // FormatForAgent returns a human-readable task-notification block that can be

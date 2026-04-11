@@ -16,6 +16,8 @@ import (
 	"fmt"
 	"log/slog"
 	"regexp"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -47,6 +49,9 @@ type ExecFunc func(ctx context.Context, command, workDir string, timeout int32) 
 // WriteFileFunc writes content to a file in the container.
 type WriteFileFunc func(ctx context.Context, path string, data []byte) error
 
+// ReadFileFunc reads content from a file in the container.
+type ReadFileFunc func(ctx context.Context, path string) ([]byte, error)
+
 // Manager tracks background tasks and delivers completion notifications.
 type Manager struct {
 	mu            sync.Mutex
@@ -54,6 +59,7 @@ type Manager struct {
 	notifications []Notification     // pending notifications, protected by mu
 	seq           uint64             // monotonic task ID counter
 	logger        *slog.Logger
+	wakeFunc      func(botID, sessionID, currentPlatform, replyTarget string) // optional callback to wake agent on new notification
 }
 
 // New creates a new background task Manager.
@@ -67,6 +73,34 @@ func New(logger *slog.Logger) *Manager {
 	}
 }
 
+// SetWakeFunc registers a callback that is invoked (in a goroutine) whenever a
+// new notification is enqueued. Use this to wake up a sleeping agent so it
+// can drain the notification immediately instead of waiting for user input.
+func (m *Manager) SetWakeFunc(fn func(botID, sessionID, currentPlatform, replyTarget string)) {
+	m.mu.Lock()
+	m.wakeFunc = fn
+	m.mu.Unlock()
+}
+
+// enqueueNotification appends n to the pending list and, if a wake function is
+// registered, calls it asynchronously so the agent can process the notification.
+func (m *Manager) enqueueNotification(n Notification) {
+	m.mu.Lock()
+	m.notifications = append(m.notifications, n)
+	wakeFn := m.wakeFunc
+	m.mu.Unlock()
+	m.logger.Info("notification enqueued",
+		slog.String("task_id", n.TaskID),
+		slog.String("bot_id", n.BotID),
+		slog.String("platform", n.CurrentPlatform),
+		slog.String("reply_target", n.ReplyTarget),
+		slog.Bool("has_wake_func", wakeFn != nil),
+	)
+	if wakeFn != nil {
+		go wakeFn(n.BotID, n.SessionID, n.CurrentPlatform, n.ReplyTarget)
+	}
+}
+
 // Spawn starts a command in the background. It returns the task ID immediately.
 // The command runs asynchronously; when it completes, a Notification is sent
 // to the Notifications channel.
@@ -74,9 +108,10 @@ func New(logger *slog.Logger) *Manager {
 // execFn should call bridge.Client.Exec (or equivalent).
 // writeFn should call bridge.Client.WriteFile to persist output logs.
 func (m *Manager) Spawn(
-	botID, sessionID, command, workDir, description string,
+	botID, sessionID, currentPlatform, replyTarget, command, workDir, description string,
 	execFn ExecFunc,
 	writeFn WriteFileFunc,
+	readFn ReadFileFunc,
 ) string {
 	m.mu.Lock()
 	m.seq++
@@ -84,15 +119,17 @@ func (m *Manager) Spawn(
 	outputFile := fmt.Sprintf("%s/%s.log", OutputLogDir, taskID)
 
 	task := &Task{
-		ID:          taskID,
-		BotID:       botID,
-		SessionID:   sessionID,
-		Command:     command,
-		Description: description,
-		WorkDir:     workDir,
-		Status:      TaskRunning,
-		OutputFile:  outputFile,
-		StartedAt:   time.Now(),
+		ID:              taskID,
+		BotID:           botID,
+		SessionID:       sessionID,
+		CurrentPlatform: currentPlatform,
+		ReplyTarget:     replyTarget,
+		Command:         command,
+		Description:     description,
+		WorkDir:         workDir,
+		Status:          TaskRunning,
+		OutputFile:      outputFile,
+		StartedAt:       time.Now(),
 	}
 	m.tasks[taskID] = task
 	m.mu.Unlock()
@@ -103,7 +140,7 @@ func (m *Manager) Spawn(
 		slog.String("command", truncate(command, 120)),
 	)
 
-	go m.run(task, execFn, writeFn)
+	go m.run(task, execFn, writeFn, readFn)
 	return taskID
 }
 
@@ -112,7 +149,7 @@ func (m *Manager) Spawn(
 // waits for the result on the provided channel. This enables "flip to background"
 // where a foreground stream is handed off without killing the process.
 func (m *Manager) SpawnAdopt(
-	botID, sessionID, command, workDir, description string,
+	botID, sessionID, currentPlatform, replyTarget, command, workDir, description string,
 	resultCh <-chan AdoptResult,
 	writeFn WriteFileFunc,
 ) (taskID, outputFile string) {
@@ -122,15 +159,17 @@ func (m *Manager) SpawnAdopt(
 	outputFile = fmt.Sprintf("%s/%s.log", OutputLogDir, taskID)
 
 	task := &Task{
-		ID:          taskID,
-		BotID:       botID,
-		SessionID:   sessionID,
-		Command:     command,
-		Description: description,
-		WorkDir:     workDir,
-		Status:      TaskRunning,
-		OutputFile:  outputFile,
-		StartedAt:   time.Now(),
+		ID:              taskID,
+		BotID:           botID,
+		SessionID:       sessionID,
+		CurrentPlatform: currentPlatform,
+		ReplyTarget:     replyTarget,
+		Command:         command,
+		Description:     description,
+		WorkDir:         workDir,
+		Status:          TaskRunning,
+		OutputFile:      outputFile,
+		StartedAt:       time.Now(),
 	}
 	m.tasks[taskID] = task
 	m.mu.Unlock()
@@ -220,24 +259,24 @@ func (m *Manager) runAdopt(task *Task, resultCh <-chan AdoptResult, writeFn Writ
 	}
 
 	n := Notification{
-		TaskID:      task.ID,
-		BotID:       task.BotID,
-		SessionID:   task.SessionID,
-		Status:      status,
-		Command:     task.Command,
-		Description: task.Description,
-		ExitCode:    exitCode,
-		OutputFile:  task.OutputFile,
-		OutputTail:  task.OutputTail(),
-		Duration:    duration,
+		TaskID:          task.ID,
+		BotID:           task.BotID,
+		SessionID:       task.SessionID,
+		CurrentPlatform: task.CurrentPlatform,
+		ReplyTarget:     task.ReplyTarget,
+		Status:          status,
+		Command:         task.Command,
+		Description:     task.Description,
+		ExitCode:        exitCode,
+		OutputFile:      task.OutputFile,
+		OutputTail:      task.OutputTail(),
+		Duration:        duration,
 	}
 
-	m.mu.Lock()
-	m.notifications = append(m.notifications, n)
-	m.mu.Unlock()
+	m.enqueueNotification(n)
 }
 
-func (m *Manager) run(task *Task, execFn ExecFunc, writeFn WriteFileFunc) {
+func (m *Manager) run(task *Task, execFn ExecFunc, writeFn WriteFileFunc, readFn ReadFileFunc) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(BackgroundExecTimeout)*time.Second)
 	task.mu.Lock()
 	task.cancel = cancel
@@ -250,15 +289,30 @@ func (m *Manager) run(task *Task, execFn ExecFunc, writeFn WriteFileFunc) {
 	// Start stall watchdog to detect commands waiting for interactive input.
 	go m.stallWatchdog(ctx, task)
 
-	// Wrap command to tee output to the log file inside the container.
-	// This way, even if the agent wants to read partial output mid-run,
-	// it can use the read tool on the output file.
+	// Wrap command to tee output to the log file inside the container and
+	// capture the command exit code into a sentinel file via fd 3 redirect.
+	// Even if the gRPC stream dies after process completion, we can recover
+	// the actual exit code by reading the sentinel file.
 	wrappedCmd := fmt.Sprintf(
-		"{ %s ; } 2>&1 | tee -a %s",
-		task.Command, task.OutputFile,
+		"{ { %s ; echo $? >&3 ; } 2>&1 | tee -a %s ; } 3>%s.exit",
+		task.Command, task.OutputFile, task.OutputFile,
 	)
 
 	result, err := execFn(ctx, wrappedCmd, task.WorkDir, BackgroundExecTimeout)
+
+	// If execFn returned an error (e.g. the gRPC stream died after the process
+	// completed), try to recover the real exit code from the sentinel file.
+	if err != nil && readFn != nil {
+		if ec, recoverErr := m.readSentinelExitCode(ctx, task.OutputFile+".exit", readFn); recoverErr == nil {
+			m.logger.Info("background task: recovered exit code from sentinel file after stream error",
+				slog.String("task_id", task.ID),
+				slog.Int("recovered_exit_code", int(ec)),
+				slog.Any("stream_error", err),
+			)
+			result = &bridge.ExecResult{ExitCode: ec}
+			err = nil
+		}
+	}
 
 	// Collect output before taking the lock (AppendOutput also locks).
 	if err != nil {
@@ -306,21 +360,33 @@ func (m *Manager) run(task *Task, execFn ExecFunc, writeFn WriteFileFunc) {
 	}
 
 	n := Notification{
-		TaskID:      task.ID,
-		BotID:       task.BotID,
-		SessionID:   task.SessionID,
-		Status:      status,
-		Command:     task.Command,
-		Description: task.Description,
-		ExitCode:    exitCode,
-		OutputFile:  task.OutputFile,
-		OutputTail:  task.OutputTail(),
-		Duration:    duration,
+		TaskID:          task.ID,
+		BotID:           task.BotID,
+		SessionID:       task.SessionID,
+		CurrentPlatform: task.CurrentPlatform,
+		ReplyTarget:     task.ReplyTarget,
+		Status:          status,
+		Command:         task.Command,
+		Description:     task.Description,
+		ExitCode:        exitCode,
+		OutputFile:      task.OutputFile,
+		OutputTail:      task.OutputTail(),
+		Duration:        duration,
 	}
 
-	m.mu.Lock()
-	m.notifications = append(m.notifications, n)
-	m.mu.Unlock()
+	m.enqueueNotification(n)
+}
+
+func (m *Manager) readSentinelExitCode(ctx context.Context, path string, readFn ReadFileFunc) (int32, error) {
+	data, err := readFn(ctx, path)
+	if err != nil {
+		return 0, err
+	}
+	ec, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil {
+		return 0, fmt.Errorf("parse exit code %q: %w", string(data), err)
+	}
+	return int32(ec), nil //nolint:gosec // G115: exit codes are 0-255
 }
 
 func (m *Manager) ensureOutputDir(ctx context.Context, task *Task, writeFn WriteFileFunc) error {
@@ -499,22 +565,22 @@ func (m *Manager) stallWatchdog(ctx context.Context, task *Task) {
 		}
 
 		n := Notification{
-			TaskID:      task.ID,
-			BotID:       task.BotID,
-			SessionID:   task.SessionID,
-			Status:      TaskRunning, // still running, but stalled
-			Command:     task.Command,
-			Description: task.Description,
-			ExitCode:    0,
-			OutputFile:  task.OutputFile,
-			OutputTail:  tail,
-			Duration:    time.Since(task.StartedAt),
-			Stalled:     true,
+			TaskID:          task.ID,
+			BotID:           task.BotID,
+			SessionID:       task.SessionID,
+			CurrentPlatform: task.CurrentPlatform,
+			ReplyTarget:     task.ReplyTarget,
+			Status:          TaskRunning, // still running, but stalled
+			Command:         task.Command,
+			Description:     task.Description,
+			ExitCode:        0,
+			OutputFile:      task.OutputFile,
+			OutputTail:      tail,
+			Duration:        time.Since(task.StartedAt),
+			Stalled:         true,
 		}
 
-		m.mu.Lock()
-		m.notifications = append(m.notifications, n)
-		m.mu.Unlock()
+		m.enqueueNotification(n)
 		return // only notify once per task
 	}
 }
@@ -533,3 +599,4 @@ func joinLines(lines []string) string {
 	}
 	return result
 }
+

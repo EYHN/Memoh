@@ -87,9 +87,9 @@ func (p *MessageProvider) execSend(ctx context.Context, session SessionContext, 
 	if err != nil {
 		return nil, err
 	}
-	// Discuss mode: same-conversation sends must go through the channel
-	// adapter directly — there is no active stream to emit events into.
-	if result.Local && session.SessionType == "discuss" {
+	// Discuss and background mode: same-conversation sends must go through
+	// the channel adapter directly — there is no active stream to emit into.
+	if result.Local && (session.SessionType == "discuss" || session.SessionType == "background") {
 		sendResult, err := p.exec.SendDirect(ctx, toMessagingSession(session), result.Target, args)
 		if err != nil {
 			return nil, err

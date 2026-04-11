@@ -36,7 +36,7 @@ func TestSpawnAndNotify(t *testing.T) {
 		return &bridge.ExecResult{Stdout: "hello world\n", ExitCode: 0}, nil
 	}
 
-	taskID := mgr.Spawn("bot1", "sess1", "echo hello", "/data", "test echo", execFn, nil)
+	taskID := mgr.Spawn("bot1", "sess1", "", "", "echo hello", "/data", "test echo", execFn, nil)
 
 	if taskID == "" {
 		t.Fatal("expected non-empty task ID")
@@ -86,7 +86,7 @@ func TestSpawnFailedCommand(t *testing.T) {
 		}, nil
 	}
 
-	taskID := mgr.Spawn("bot1", "sess1", "false", "/data", "failing cmd", execFn, nil)
+	taskID := mgr.Spawn("bot1", "sess1", "", "", "false", "/data", "failing cmd", execFn, nil)
 
 	notifications := waitDrain(t, mgr, "bot1", "sess1", 1)
 	n := notifications[0]
@@ -111,7 +111,7 @@ func TestKillTask(t *testing.T) {
 		return &bridge.ExecResult{ExitCode: -1}, ctx.Err()
 	}
 
-	taskID := mgr.Spawn("bot1", "sess1", "sleep 300", "/data", "long task", execFn, nil)
+	taskID := mgr.Spawn("bot1", "sess1", "", "", "sleep 300", "/data", "long task", execFn, nil)
 
 	// Wait for the task to start.
 	select {
@@ -150,9 +150,9 @@ func TestListForSession(t *testing.T) {
 		return &bridge.ExecResult{ExitCode: -1}, ctx.Err()
 	}
 
-	mgr.Spawn("bot1", "sess1", "cmd1", "/data", "d1", execFn, nil)
-	mgr.Spawn("bot1", "sess1", "cmd2", "/data", "d2", execFn, nil)
-	mgr.Spawn("bot2", "sess2", "cmd3", "/data", "d3", execFn, nil)
+	mgr.Spawn("bot1", "sess1", "", "", "cmd1", "/data", "d1", execFn, nil)
+	mgr.Spawn("bot1", "sess1", "", "", "cmd2", "/data", "d2", execFn, nil)
+	mgr.Spawn("bot2", "sess2", "", "", "cmd3", "/data", "d3", execFn, nil)
 
 	// Wait for all to start.
 	for range 3 {
@@ -179,9 +179,9 @@ func TestDrainNotifications(t *testing.T) {
 		return &bridge.ExecResult{Stdout: "ok\n", ExitCode: 0}, nil
 	}
 
-	mgr.Spawn("bot1", "sess1", "echo 1", "/data", "", execFn, nil)
-	mgr.Spawn("bot1", "sess2", "echo 2", "/data", "", execFn, nil)
-	mgr.Spawn("bot2", "sess1", "echo 3", "/data", "", execFn, nil)
+	mgr.Spawn("bot1", "sess1", "", "", "echo 1", "/data", "", execFn, nil)
+	mgr.Spawn("bot1", "sess2", "", "", "echo 2", "/data", "", execFn, nil)
+	mgr.Spawn("bot2", "sess1", "", "", "echo 3", "/data", "", execFn, nil)
 
 	// Wait for all tasks to complete.
 	for range 3 {
@@ -213,7 +213,7 @@ func TestMarkNotifiedPreventsDoubleNotification(t *testing.T) {
 		return &bridge.ExecResult{Stdout: "ok\n", ExitCode: 0}, nil
 	}
 
-	taskID := mgr.Spawn("bot1", "sess1", "echo hi", "/data", "", execFn, nil)
+	taskID := mgr.Spawn("bot1", "sess1", "", "", "echo hi", "/data", "", execFn, nil)
 	notifications := waitDrain(t, mgr, "bot1", "sess1", 1)
 	if len(notifications) != 1 {
 		t.Fatalf("expected exactly 1 notification, got %d", len(notifications))
@@ -272,7 +272,7 @@ func TestRunningTasksSummary(t *testing.T) {
 		return &bridge.ExecResult{ExitCode: -1}, ctx.Err()
 	}
 
-	mgr.Spawn("bot1", "sess1", "npm test", "/data", "Run tests", execFn, nil)
+	mgr.Spawn("bot1", "sess1", "", "", "npm test", "/data", "Run tests", execFn, nil)
 	<-started
 
 	summary := mgr.RunningTasksSummary("bot1", "sess1")

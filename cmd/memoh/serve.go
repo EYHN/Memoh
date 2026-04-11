@@ -427,6 +427,9 @@ func provideChatResolver(log *slog.Logger, a *agentpkg.Agent, modelsService *mod
 	resolver.SetCompactionService(compactionService)
 	resolver.SetPipeline(pipeline)
 	resolver.SetBackgroundManager(bgManager)
+	bgManager.SetWakeFunc(func(botID, sessionID, currentPlatform, replyTarget string) {
+		go resolver.TriggerBackgroundNotification(context.Background(), botID, sessionID, currentPlatform, replyTarget)
+	})
 	return resolver
 }
 

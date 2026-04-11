@@ -209,9 +209,17 @@ func (r *Resolver) deliverBackgroundNotifications(ctx context.Context, botID, se
 		slog.String("reply_target", replyTarget),
 		slog.Int("count", len(notifMessages)),
 	)
+	// Use replyTarget as ChatID so history is loaded for this specific chat
+	// (e.g. private chat vs group chat), not the bot-wide catch-all. Without
+	// this, the agent sees recent messages from other chats in the same session
+	// and may call send with the wrong target.
+	chatID := strings.TrimSpace(replyTarget)
+	if chatID == "" {
+		chatID = botID
+	}
 	req := conversation.ChatRequest{
 		BotID:          botID,
-		ChatID:         botID,
+		ChatID:         chatID,
 		SessionID:      sessionID,
 		Query:          "[background notification]",
 		CurrentChannel: currentPlatform,

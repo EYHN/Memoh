@@ -59,7 +59,7 @@ type Manager struct {
 	notifications []Notification     // pending notifications, protected by mu
 	seq           uint64             // monotonic task ID counter
 	logger        *slog.Logger
-	wakeFunc      func(botID, sessionID, currentPlatform, replyTarget string) // optional callback to wake agent on new notification
+	wakeFunc      func(botID, sessionID string) // optional callback to wake agent on new notification
 }
 
 // New creates a new background task Manager.
@@ -76,7 +76,7 @@ func New(logger *slog.Logger) *Manager {
 // SetWakeFunc registers a callback that is invoked (in a goroutine) whenever a
 // new notification is enqueued. Use this to wake up a sleeping agent so it
 // can drain the notification immediately instead of waiting for user input.
-func (m *Manager) SetWakeFunc(fn func(botID, sessionID, currentPlatform, replyTarget string)) {
+func (m *Manager) SetWakeFunc(fn func(botID, sessionID string)) {
 	m.mu.Lock()
 	m.wakeFunc = fn
 	m.mu.Unlock()
@@ -97,7 +97,7 @@ func (m *Manager) enqueueNotification(n Notification) {
 		slog.Bool("has_wake_func", wakeFn != nil),
 	)
 	if wakeFn != nil {
-		go wakeFn(n.BotID, n.SessionID, n.CurrentPlatform, n.ReplyTarget)
+		go wakeFn(n.BotID, n.SessionID)
 	}
 }
 

@@ -60,6 +60,7 @@ type Manager struct {
 	seq           uint64             // monotonic task ID counter
 	logger        *slog.Logger
 	wakeFunc      func(botID, sessionID string) // optional callback to wake agent on new notification
+	sleepSignal   sync.Map                      // key: "botID:sessionID" → struct{}, set by Sleep tool
 }
 
 // New creates a new background task Manager.
@@ -294,24 +295,42 @@ func (m *Manager) run(task *Task, execFn ExecFunc, writeFn WriteFileFunc, readFn
 	// Even if the gRPC stream dies after process completion, we can recover
 	// the actual exit code by reading the sentinel file.
 	wrappedCmd := fmt.Sprintf(
-		"{ { %s ; echo $? >&3 ; } 2>&1 | tee -a %s ; } 3>%s.exit",
+		"{ { ( %s ) ; echo $? >&3 ; } 2>&1 | tee %s ; } 3>%s.exit",
 		task.Command, task.OutputFile, task.OutputFile,
 	)
 
 	result, err := execFn(ctx, wrappedCmd, task.WorkDir, BackgroundExecTimeout)
 
-	// If execFn returned an error (e.g. the gRPC stream died after the process
-	// completed), try to recover the real exit code from the sentinel file.
-	if err != nil && readFn != nil {
-		if ec, recoverErr := m.readSentinelExitCode(ctx, task.OutputFile+".exit", readFn); recoverErr == nil {
-			m.logger.Info("background task: recovered exit code from sentinel file after stream error",
-				slog.String("task_id", task.ID),
-				slog.Int("recovered_exit_code", int(ec)),
-				slog.Any("stream_error", err),
-			)
+	if err != nil {
+		m.logger.Warn("background task: execFn returned error",
+			slog.String("task_id", task.ID),
+			slog.Any("exec_error", err),
+		)
+	}
+
+	// Always prefer the sentinel file for the real exit code.
+	// The wrappedCmd uses a pipeline: the shell exits with tee's code (0),
+	// not the actual command's code. The sentinel captures the real value.
+	// On gRPC error the sentinel also lets us recover without -1.
+	if readFn != nil {
+		ec, recoverErr := m.readSentinelExitCode(ctx, task.OutputFile+".exit", readFn)
+		if recoverErr == nil {
+			if err != nil {
+				m.logger.Info("background task: recovered exit code from sentinel file after stream error",
+					slog.String("task_id", task.ID),
+					slog.Int("recovered_exit_code", int(ec)),
+					slog.Any("stream_error", err),
+				)
+			}
 			result = &bridge.ExecResult{ExitCode: ec}
 			err = nil
+		} else if err != nil {
+			m.logger.Warn("background task: sentinel recovery failed",
+				slog.String("task_id", task.ID),
+				slog.Any("recover_error", recoverErr),
+			)
 		}
+		// If err==nil but sentinel unreadable: fall through to use gRPC exit code
 	}
 
 	// Collect output before taking the lock (AppendOutput also locks).
@@ -495,6 +514,48 @@ func (m *Manager) Cleanup(maxAge time.Duration) {
 			delete(m.tasks, id)
 		}
 	}
+}
+
+// SignalSleep records that the agent just executed a sleep tool, so the next
+// mid-turn drain should deliver all pending notifications (not just stalled ones).
+func (m *Manager) SignalSleep(botID, sessionID string) {
+	m.sleepSignal.Store(botID+":"+sessionID, struct{}{})
+}
+
+// ConsumeSleepSignal atomically checks and clears the sleep signal for a session.
+// Returns true if a sleep was signaled since the last consume.
+func (m *Manager) ConsumeSleepSignal(botID, sessionID string) bool {
+	_, loaded := m.sleepSignal.LoadAndDelete(botID + ":" + sessionID)
+	return loaded
+}
+
+// DrainOneNotification removes and returns the first pending notification for
+// the given bot+session, or nil if there are none. Used by the trigger loop
+// to process notifications one at a time.
+func (m *Manager) DrainOneNotification(botID, sessionID string) *Notification {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for i, n := range m.notifications {
+		if n.BotID == botID && n.SessionID == sessionID {
+			// Remove from slice preserving order.
+			m.notifications = append(m.notifications[:i], m.notifications[i+1:]...)
+			return &n
+		}
+	}
+	return nil
+}
+
+// RequeueNotifications puts notifications back into the pending queue.
+// Used when mid-turn drain filters out notifications that should be
+// delivered later (e.g. non-stalled notifications when no sleep was signaled).
+func (m *Manager) RequeueNotifications(ns []Notification) {
+	if len(ns) == 0 {
+		return
+	}
+	m.mu.Lock()
+	m.notifications = append(m.notifications, ns...)
+	m.mu.Unlock()
 }
 
 // promptPatterns matches common interactive prompt endings that indicate

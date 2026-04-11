@@ -281,6 +281,7 @@ func runServe() {
 
 			startScheduleService,
 			startHeartbeatService,
+			wireResolverOutbound,
 			startChannelManager,
 			startEmailManager,
 			startContainerReconciliation,
@@ -949,6 +950,15 @@ func startHeartbeatService(lc fx.Lifecycle, heartbeatService *heartbeat.Service)
 		OnStart: func(ctx context.Context) error {
 			return heartbeatService.Bootstrap(ctx)
 		},
+	})
+}
+
+func wireResolverOutbound(resolver *flow.Resolver, channelManager *channel.Manager) {
+	resolver.SetOutboundFn(func(ctx context.Context, botID, channelType, target, text string) error {
+		return channelManager.Send(ctx, botID, channel.ChannelType(channelType), channel.SendRequest{
+			Target:  target,
+			Message: channel.Message{Text: text},
+		})
 	})
 }
 

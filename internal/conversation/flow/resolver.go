@@ -76,6 +76,8 @@ type Resolver struct {
 	assetLoader       gatewayAssetLoader
 	pipeline          *pipelinepkg.Pipeline
 	bgManager         *background.Manager
+	outboundFn        func(ctx context.Context, botID, channelType, target, text string) error
+	bgNotifActive     sync.Map // key: "botID:sessionID" → prevents concurrent notification loops
 	timeout           time.Duration
 	clockLocation     *time.Location
 	logger            *slog.Logger
@@ -139,6 +141,13 @@ func (r *Resolver) SetCompactionService(s *compaction.Service) {
 // background exec notifications are injected into the agent loop.
 func (r *Resolver) SetBackgroundManager(m *background.Manager) {
 	r.bgManager = m
+}
+
+// SetOutboundFn configures the function used to deliver background notification
+// responses to the user. This mirrors Claude Code's design where the agent's text
+// output is automatically delivered through the same path as normal responses.
+func (r *Resolver) SetOutboundFn(fn func(ctx context.Context, botID, channelType, target, text string) error) {
+	r.outboundFn = fn
 }
 
 // SetPipeline configures the DCP pipeline for RC-based context assembly.

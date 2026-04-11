@@ -555,8 +555,22 @@ func drainBackgroundNotifications(
 		p.System = baseSystem
 	}
 
+	// Check whether the agent just executed a sleep tool. This mirrors
+	// Claude Code's priority model: stalled notifications are "next" priority
+	// (always delivered mid-turn), while completion notifications are "later"
+	// priority (only delivered after a sleep).
+	sleptRecently := mgr.ConsumeSleepSignal(botID, sessionID)
+
 	notifications := mgr.DrainNotifications(botID, sessionID)
+	var requeue []background.Notification
 	for _, n := range notifications {
+		// Without a sleep signal, only drain stalled notifications mid-turn.
+		// Completion notifications are re-enqueued for the trigger loop or
+		// next sleep boundary.
+		if !sleptRecently && !n.Stalled {
+			requeue = append(requeue, n)
+			continue
+		}
 		var prefix string
 		if n.Stalled {
 			prefix = "A background task appears stuck and may need attention:"
@@ -572,6 +586,8 @@ func drainBackgroundNotifications(
 			slog.String("bot_id", botID),
 		)
 	}
+	// Put back non-consumed notifications.
+	mgr.RequeueNotifications(requeue)
 	return p
 }
 

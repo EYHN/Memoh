@@ -166,37 +166,47 @@ func (r *Resolver) TriggerBackgroundNotification(ctx context.Context, botID, ses
 		return
 	}
 
-	notifications := r.bgManager.DrainNotifications(botID, sessionID)
-	if len(notifications) == 0 {
+	// Per-session concurrency guard: only one notification delivery loop may
+	// run at a time for a given (botID, sessionID). If a loop is already
+	// active, skip — the running loop's prepareStep hook or the drain-loop
+	// below will pick up any new notifications. This prevents the "agent
+	// storm" where N concurrent Generate() calls each spawn more tasks,
+	// creating exponential growth.
+	key := botID + ":" + sessionID
+	if _, loaded := r.bgNotifActive.LoadOrStore(key, true); loaded {
+		r.logger.Info("background notification trigger: already active, skipping",
+			slog.String("bot_id", botID),
+			slog.String("session_id", sessionID),
+		)
 		return
 	}
+	defer r.bgNotifActive.Delete(key)
 
-	// Group by the reply source recorded at task-spawn time so each channel
-	// receives only its own notifications.
-	type notifItem struct {
-		text    string
-		stalled bool
-	}
-	type channelKey struct{ platform, target string }
-	groups := make(map[channelKey][]notifItem)
-	for _, n := range notifications {
+	// Drain loop: after delivering one batch, check for new notifications
+	// that arrived during the Generate() call (e.g. another task completed
+	// while the agent was responding to the first). Capped to prevent
+	// runaway loops if the agent keeps spawning tasks in its response.
+	const maxRounds = 10
+	for round := 0; round < maxRounds; round++ {
+		n := r.bgManager.DrainOneNotification(botID, sessionID)
+		if n == nil {
+			return
+		}
+
 		var prefix string
 		if n.Stalled {
 			prefix = "A background task appears stuck and may need attention:"
 		} else {
 			prefix = "A background task completed:"
 		}
-		k := channelKey{n.CurrentPlatform, n.ReplyTarget}
-		groups[k] = append(groups[k], notifItem{prefix + "\n" + n.FormatForAgent(), n.Stalled})
+		msgs := []sdk.Message{sdk.UserMessage(prefix + "\n" + n.FormatForAgent())}
+		r.deliverBackgroundNotifications(ctx, botID, sessionID, n.CurrentPlatform, n.ReplyTarget, msgs)
 	}
-
-	for k, items := range groups {
-		var msgs []sdk.Message
-		for _, item := range items {
-			msgs = append(msgs, sdk.UserMessage(item.text))
-		}
-		r.deliverBackgroundNotifications(ctx, botID, sessionID, k.platform, k.target, msgs)
-	}
+	r.logger.Warn("background notification trigger: max rounds reached",
+		slog.String("bot_id", botID),
+		slog.String("session_id", sessionID),
+		slog.Int("max_rounds", maxRounds),
+	)
 }
 
 // deliverBackgroundNotifications runs a single agent call to deliver a batch of
@@ -238,11 +248,14 @@ func (r *Resolver) deliverBackgroundNotifications(ctx context.Context, botID, se
 	}
 
 	cfg := rc.runConfig
-	cfg.SessionType = "background"
 	// Inject drained notifications so the first LLM call sees them.
 	cfg.Messages = append(cfg.Messages, notifMessages...)
 	// Clear query so prepareRunConfig does not append a redundant user message.
 	cfg.Query = ""
+	// Use the natural session type — same system prompt, same tools, same
+	// personality as a regular conversation turn. This matches Claude Code's
+	// design where between-turn notifications go through the same query()
+	// function as normal user messages.
 	cfg = r.prepareRunConfig(ctx, cfg)
 
 	result, err := r.agent.Generate(ctx, cfg)
@@ -268,5 +281,19 @@ func (r *Resolver) deliverBackgroundNotifications(ctx context.Context, botID, se
 		notifModelMessages := sdkMessagesToModelMessages(notifMessages)
 		roundMessages := append(notifModelMessages, outputMessages...)
 		_ = r.storeRound(ctx, req, roundMessages, rc.model.ID)
+	}
+
+	// Auto-deliver the agent's text response to the user — mirrors Claude
+	// Code where the agent's output is displayed through the normal REPL
+	// output path, not through a special "send" tool call.
+	if text := strings.TrimSpace(result.Text); text != "" && r.outboundFn != nil {
+		if err := r.outboundFn(ctx, botID, currentPlatform, replyTarget, text); err != nil {
+			r.logger.Warn("background notification: outbound delivery failed",
+				slog.String("bot_id", botID),
+				slog.String("platform", currentPlatform),
+				slog.String("reply_target", replyTarget),
+				slog.Any("error", err),
+			)
+		}
 	}
 }

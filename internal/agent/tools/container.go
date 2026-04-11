@@ -162,6 +162,57 @@ func (p *ContainerProvider) Tools(_ context.Context, session SessionContext) ([]
 				return p.execBgStatus(ctx.Context, sess, inputAsMap(input))
 			},
 		},
+		{
+			Name:        "sleep",
+			Description: "Wait for a specified duration. Use this when waiting for background tasks or when idle. Prefer this over exec(sleep N).",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"duration_seconds": map[string]any{
+						"type":        "integer",
+						"description": "How long to sleep in seconds (1-300). Default: 10.",
+						"minimum":     1,
+						"maximum":     300,
+						"default":     10,
+					},
+				},
+			},
+			Execute: func(ctx *sdk.ToolExecContext, input any) (any, error) {
+				args := inputAsMap(input)
+				seconds := 10
+				if v, ok, err := IntArg(args, "duration_seconds"); err != nil {
+					return nil, fmt.Errorf("invalid duration_seconds: %w", err)
+				} else if ok {
+					if v < 1 {
+						v = 1
+					}
+					if v > 300 {
+						v = 300
+					}
+					seconds = v
+				}
+
+				timer := time.NewTimer(time.Duration(seconds) * time.Second)
+				defer timer.Stop()
+				select {
+				case <-timer.C:
+				case <-ctx.Context.Done():
+					return map[string]any{
+						"status":  "interrupted",
+						"message": "Sleep was interrupted.",
+					}, nil
+				}
+
+				if p.bgManager != nil {
+					p.bgManager.SignalSleep(sess.BotID, sess.SessionID)
+				}
+
+				return map[string]any{
+					"status":  "ok",
+					"message": fmt.Sprintf("Slept for %d seconds.", seconds),
+				}, nil
+			},
+		},
 	}, nil
 }
 
@@ -427,25 +478,31 @@ func (p *ContainerProvider) execExecWithFlip(
 ) (any, error) {
 	// Start streaming exec with a large container-side timeout so the process
 	// keeps running even after we stop reading in the foreground.
-	// Use context.WithoutCancel so the gRPC stream is not killed when the
-	// foreground agent context ends (e.g. session completes while the command
-	// is still running and about to be flipped to background).
-	stream, err := client.ExecStream(context.WithoutCancel(ctx), command, workDir, background.BackgroundExecTimeout)
+	// Use a fully independent context (not derived from the agent request ctx)
+	// so the gRPC stream is never cancelled when the foreground session ends.
+	streamCtx, streamCancel := context.WithTimeout(context.Background(), time.Duration(background.BackgroundExecTimeout)*time.Second)
+	stream, err := client.ExecStream(streamCtx, command, workDir, background.BackgroundExecTimeout)
 	if err != nil {
+		streamCancel()
 		return nil, err
 	}
 
 	resultCh := make(chan background.AdoptResult, 1)
 	go func() {
+		defer streamCancel()
 		var stdout, stderr strings.Builder
 		var exitCode int32
 		for {
-			msg, err := stream.Recv()
-			if errors.Is(err, io.EOF) {
+			msg, recvErr := stream.Recv()
+			if errors.Is(recvErr, io.EOF) {
 				break
 			}
-			if err != nil {
-				resultCh <- background.AdoptResult{Err: err}
+			if recvErr != nil {
+				p.logger.Warn("flip-to-background: stream recv error",
+					slog.String("command", truncateStr(command, 80)),
+					slog.Any("error", recvErr),
+				)
+				resultCh <- background.AdoptResult{Err: recvErr}
 				return
 			}
 			switch msg.GetStream() {
@@ -554,7 +611,13 @@ func (p *ContainerProvider) spawnBackground(
 		return client.WriteFile(ctx, path, data)
 	}
 	readFn := func(ctx context.Context, path string) ([]byte, error) {
-		resp, err := client.ReadFile(ctx, path, 1, 10)
+		// Use pool to get a fresh client — the original client may be in a failed
+		// state if the streaming exec errored, but the pool will re-dial as needed.
+		c, err := p.clients.MCPClient(ctx, session.BotID)
+		if err != nil {
+			return nil, err
+		}
+		resp, err := c.ReadFile(ctx, path, 1, 10)
 		if err != nil {
 			return nil, err
 		}

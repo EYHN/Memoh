@@ -56,6 +56,7 @@ func init() {
 	systemHeartbeatTmpl = resolveIncludes(systemHeartbeatTmpl)
 	systemScheduleTmpl = resolveIncludes(systemScheduleTmpl)
 	systemSubagentTmpl = resolveIncludes(systemSubagentTmpl)
+	systemBackgroundTmpl = resolveIncludes(systemBackgroundTmpl)
 }
 
 func mustReadPrompt(name string) string {

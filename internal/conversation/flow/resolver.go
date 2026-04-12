@@ -19,6 +19,7 @@ import (
 
 	"github.com/memohai/memoh/internal/accounts"
 	agentpkg "github.com/memohai/memoh/internal/agent"
+	"github.com/memohai/memoh/internal/agent/background"
 	"github.com/memohai/memoh/internal/compaction"
 	"github.com/memohai/memoh/internal/conversation"
 	"github.com/memohai/memoh/internal/db/sqlc"
@@ -74,6 +75,9 @@ type Resolver struct {
 	skillLoader       SkillLoader
 	assetLoader       gatewayAssetLoader
 	pipeline          *pipelinepkg.Pipeline
+	bgManager         *background.Manager
+	outboundFn        func(ctx context.Context, botID, channelType, target, text string) error
+	bgNotifActive     sync.Map // key: "botID:sessionID" → prevents concurrent notification loops
 	timeout           time.Duration
 	clockLocation     *time.Location
 	logger            *slog.Logger
@@ -131,6 +135,19 @@ func (r *Resolver) SetGatewayAssetLoader(loader gatewayAssetLoader) {
 // SetCompactionService configures the compaction service for context compaction.
 func (r *Resolver) SetCompactionService(s *compaction.Service) {
 	r.compactionService = s
+}
+
+// SetBackgroundManager configures the background task manager so that
+// background exec notifications are injected into the agent loop.
+func (r *Resolver) SetBackgroundManager(m *background.Manager) {
+	r.bgManager = m
+}
+
+// SetOutboundFn configures the function used to deliver background notification
+// responses to the user. This mirrors Claude Code's design where the agent's text
+// output is automatically delivered through the same path as normal responses.
+func (r *Resolver) SetOutboundFn(fn func(ctx context.Context, botID, channelType, target, text string) error) {
+	r.outboundFn = fn
 }
 
 // SetPipeline configures the DCP pipeline for RC-based context assembly.
@@ -434,8 +451,9 @@ func (r *Resolver) buildBaseRunConfig(ctx context.Context, p baseRunConfigParams
 			TimezoneLocation:  userClockLocation,
 			SessionToken:      p.SessionToken,
 		},
-		Skills:        agentSkills,
-		LoopDetection: agentpkg.LoopDetectionConfig{Enabled: loopDetectionEnabled},
+		Skills:            agentSkills,
+		LoopDetection:     agentpkg.LoopDetectionConfig{Enabled: loopDetectionEnabled},
+		BackgroundManager: r.bgManager,
 	}
 
 	return cfg, chatModel, provider, nil

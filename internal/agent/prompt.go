@@ -21,6 +21,7 @@ var (
 	systemSubagentTmpl  string
 	scheduleTmpl        string
 	heartbeatTmpl       string
+	systemBackgroundTmpl string
 
 	MemoryExtractPrompt string
 	MemoryUpdatePrompt  string
@@ -36,6 +37,7 @@ func init() {
 	systemHeartbeatTmpl = mustReadPrompt("prompts/system_heartbeat.md")
 	systemScheduleTmpl = mustReadPrompt("prompts/system_schedule.md")
 	systemSubagentTmpl = mustReadPrompt("prompts/system_subagent.md")
+	systemBackgroundTmpl = mustReadPrompt("prompts/system_background.md")
 	scheduleTmpl = mustReadPrompt("prompts/schedule.md")
 	heartbeatTmpl = mustReadPrompt("prompts/heartbeat.md")
 	MemoryExtractPrompt = mustReadPrompt("prompts/memory_extract.md")
@@ -54,6 +56,7 @@ func init() {
 	systemHeartbeatTmpl = resolveIncludes(systemHeartbeatTmpl)
 	systemScheduleTmpl = resolveIncludes(systemScheduleTmpl)
 	systemSubagentTmpl = resolveIncludes(systemSubagentTmpl)
+	systemBackgroundTmpl = resolveIncludes(systemBackgroundTmpl)
 }
 
 func mustReadPrompt(name string) string {
@@ -96,6 +99,8 @@ func selectSystemTemplate(sessionType string) string {
 		return systemHeartbeatTmpl
 	case "schedule":
 		return systemScheduleTmpl
+	case "background":
+		return systemBackgroundTmpl
 	case "subagent":
 		return systemSubagentTmpl
 	default:

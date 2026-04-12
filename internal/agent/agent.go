@@ -10,6 +10,7 @@ import (
 
 	sdk "github.com/memohai/twilight-ai/sdk"
 
+	"github.com/memohai/memoh/internal/agent/background"
 	"github.com/memohai/memoh/internal/agent/tools"
 	"github.com/memohai/memoh/internal/models"
 	"github.com/memohai/memoh/internal/workspace/bridge"
@@ -151,6 +152,23 @@ func (a *Agent) runStream(ctx context.Context, cfg RunConfig, ch chan<- StreamEv
 				}
 				break
 			}
+			return p
+		}
+	}
+
+	// Drain background task notifications at step boundaries.
+	// Each notification is injected as a user message so the model
+	// discovers completed background work naturally.
+	if cfg.BackgroundManager != nil {
+		basePrepare := prepareStep
+		baseSystem := cfg.System // capture original system prompt to avoid accumulation
+		prepareStep = func(p *sdk.GenerateParams) *sdk.GenerateParams {
+			if basePrepare != nil {
+				if override := basePrepare(p); override != nil {
+					p = override
+				}
+			}
+			p = drainBackgroundNotifications(p, cfg.BackgroundManager, baseSystem, cfg.Identity.BotID, cfg.Identity.SessionID, a.logger)
 			return p
 		}
 	}
@@ -348,6 +366,22 @@ func (a *Agent) runGenerate(ctx context.Context, cfg RunConfig) (*GenerateResult
 	if readMediaState != nil {
 		prepareStep = readMediaState.prepareStep
 	}
+
+	// Drain background task notifications at step boundaries (non-streaming).
+	if cfg.BackgroundManager != nil {
+		basePrepare := prepareStep
+		baseSystem := cfg.System
+		prepareStep = func(p *sdk.GenerateParams) *sdk.GenerateParams {
+			if basePrepare != nil {
+				if override := basePrepare(p); override != nil {
+					p = override
+				}
+			}
+			p = drainBackgroundNotifications(p, cfg.BackgroundManager, baseSystem, cfg.Identity.BotID, cfg.Identity.SessionID, a.logger)
+			return p
+		}
+	}
+
 	opts := a.buildGenerateOptions(cfg, sdkTools, prepareStep)
 	opts = append(opts,
 		sdk.WithOnStep(func(step *sdk.StepResult) *sdk.GenerateParams {
@@ -507,6 +541,62 @@ func toolStreamEventToAgentEvent(evt tools.ToolStreamEvent) StreamEvent {
 	default:
 		return StreamEvent{}
 	}
+}
+
+// drainBackgroundNotifications non-blockingly drains pending background task
+// notifications for the given bot+session and injects them as user messages
+// into the next LLM step. This follows the same pattern as Claude Code's
+// task-notification injection via query() at step boundaries.
+func drainBackgroundNotifications(
+	p *sdk.GenerateParams,
+	mgr *background.Manager,
+	baseSystem string,
+	botID, sessionID string,
+	logger *slog.Logger,
+) *sdk.GenerateParams {
+	// Inject running tasks summary into system prompt so the model
+	// knows about ongoing background work even after compaction.
+	// Always start from baseSystem to avoid accumulating summaries across steps.
+	if summary := mgr.RunningTasksSummary(botID, sessionID); summary != "" {
+		p.System = baseSystem + "\n\n" + summary
+	} else {
+		p.System = baseSystem
+	}
+
+	// Check whether the agent just executed a sleep tool. This mirrors
+	// Claude Code's priority model: stalled notifications are "next" priority
+	// (always delivered mid-turn), while completion notifications are "later"
+	// priority (only delivered after a sleep).
+	sleptRecently := mgr.ConsumeSleepSignal(botID, sessionID)
+
+	notifications := mgr.DrainNotifications(botID, sessionID)
+	var requeue []background.Notification
+	for _, n := range notifications {
+		// Without a sleep signal, only drain stalled notifications mid-turn.
+		// Completion notifications are re-enqueued for the trigger loop or
+		// next sleep boundary.
+		if !sleptRecently && !n.Stalled {
+			requeue = append(requeue, n)
+			continue
+		}
+		var prefix string
+		if n.Stalled {
+			prefix = "A background task appears stuck and may need attention:"
+		} else {
+			prefix = "A background task completed:"
+		}
+		text := fmt.Sprintf("%s\n%s", prefix, n.FormatForAgent())
+		p.Messages = append(p.Messages, sdk.UserMessage(text))
+		logger.Info("injected background task notification",
+			slog.String("task_id", n.TaskID),
+			slog.String("status", string(n.Status)),
+			slog.Bool("stalled", n.Stalled),
+			slog.String("bot_id", botID),
+		)
+	}
+	// Put back non-consumed notifications.
+	mgr.RequeueNotifications(requeue)
+	return p
 }
 
 func wrapToolsWithLoopGuard(tools []sdk.Tool, guard *ToolLoopGuard, abortCallIDs map[string]struct{}) []sdk.Tool {
